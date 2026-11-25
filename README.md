@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/repo-banner.png" alt="CPU Scheduling Simulator banner" width="100%">
+</p>
+
 # CPU Scheduling Simulator
 
 A desktop application for learning and comparing CPU scheduling algorithms. Built with Python and PyQt6, it provides process configuration, step-by-step simulation, Gantt charts, performance metrics, algorithm comparison, and import/export tools.
@@ -35,6 +39,50 @@ Priority convention, priority aging, context-switch time, quantum, queue configu
 - View waiting, turnaround, completion, response, utilization, throughput, idle time, and context-switch metrics.
 - Export reports to Excel or CSV and export Gantt charts to PNG.
 - Switch between light and dark themes.
+
+## Screenshots
+
+### FCFS in Light Mode
+
+![FCFS light mode](assets/fcfs-light-mode.png)
+
+The main FCFS view presents algorithm settings, process configuration, Gantt chart visualization, performance metrics, and the detailed results table in the light theme.
+
+### Dark Mode
+
+![Dark mode](assets/dark-mode.png)
+
+Switch between light and dark themes to use the simulator in either interface style. The dark theme provides the same scheduling, chart, process, and comparison controls with a low-light appearance.
+
+### Detailed FCFS Summary
+
+![FCFS summary](assets/fcfs-summary.png)
+
+The summary view explains the overall execution order and provides process-by-process details about completion, turnaround, waiting, response, and deadline results.
+
+### Step-by-Step Execution
+
+![FCFS step-by-step replay](assets/fcfs-steps.png)
+
+Step-by-step mode lets you replay the simulation decision by decision. Each step shows the running process, ready queue, remaining burst times, context switches, and the reason for the scheduling outcome.
+
+### Gantt Chart Export
+
+![Gantt chart PNG export](assets/gantt-png.png)
+
+The Gantt chart can be exported as a PNG image using a standard save dialog for use in reports, presentations, or coursework.
+
+### Algorithm Comparison
+
+![Algorithm comparison](assets/comparisons.png)
+
+The comparison feature ranks all supported algorithms by selectable metrics such as average turnaround time, waiting time, response time, CPU utilization, or context switches.
+
+### CSV Export
+
+![CSV export](assets/export-csv.png)
+
+Simulation results can be exported to CSV, making the process metrics and scheduling results available for spreadsheets and further analysis.
 
 ## Requirements
 
@@ -142,6 +190,7 @@ CPU-Scheduling-Simulator-main/
 |-- requirements.txt                # Python dependencies
 |-- sample_processes.xlsx           # Example process input workbook
 |-- cpu_scheduling_dynamic_v2.ipynb
+|-- assets/                        # README banner and application screenshots
 |-- LICENSE
 |-- README.md
 `-- .gitignore
