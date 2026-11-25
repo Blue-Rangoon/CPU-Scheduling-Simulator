@@ -21,10 +21,6 @@ The project makes operating-system CPU scheduling behavior easier to understand 
 | Priority + Round Robin | `PRIO_RR` | Preemptive | Uses priority across groups and Round Robin for processes with equal priority. |
 | Highest Response Ratio Next | `HRRN` | Non-preemptive | Selects the process with the highest `(waiting time + burst time) / burst time` ratio. |
 | Multilevel Queue | `MLQ` | Queue-based | Assigns processes to fixed queues and uses a configured scheduling policy for each queue. |
-| Multilevel Feedback Queue | `MLFQ` | Preemptive, queue-based | Moves processes between queues based on configured time quanta. |
-| Earliest Deadline First | `EDF` | Preemptive, real-time | Runs the process with the nearest absolute deadline. |
-| Lottery Scheduling | `LOTTERY` | Preemptive | Gives each process tickets and randomly selects a winner for each scheduling quantum. |
-| Stride Scheduling | `STRIDE` | Preemptive | Deterministically provides proportional CPU sharing using stride/pass values. |
 
 Priority convention, priority aging, context-switch time, quantum, queue configuration, lottery seed, and other algorithm-specific options are configurable in the application.
 
