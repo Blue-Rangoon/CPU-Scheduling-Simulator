@@ -1,14 +1,78 @@
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+"""
+CPU Scheduling engine.
+
+Pure-Python (no GUI dependency).  Every algorithm is run through one common
+simulation loop which records, for every CPU slice, a detailed `Step`
+(time, ready queue, remaining times, events, reason for the decision).
+"""
+from __future__ import annotations
+
+import colorsys
+import random
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
+
+EPS = 1e-9
+INF = float("inf")
 
 
+# --------------------------------------------------------------------------- #
+#  Data classes
+# --------------------------------------------------------------------------- #
 @dataclass
 class ProcessInput:
     pid: str
     at: float
     bt: float
     priority: int = 0
-    queue_level: int = 0  # 0 = Foreground/High, 1 = Background/Low
+    queue_level: int = 0               # for Multilevel Queue (0 = highest)
+    deadline: Optional[float] = None   # absolute deadline (EDF)
+
+
+@dataclass
+class SchedOptions:
+    quantum: float = 2.0
+    cs_time: float = 0.0
+    high_is_priority: bool = False     # False -> lower number = higher priority
+    aging: float = 0.0                 # 0 = off; else priority improves by 1 / interval
+    seed: int = 1                      # lottery
+    # Multilevel Queue: one (algorithm, quantum) per queue. algo in FCFS/RR/SJF/PRIORITY
+    mlq_levels: List[Tuple[str, float]] = field(
+        default_factory=lambda: [("RR", 2.0), ("SJF", 0.0), ("FCFS", 0.0)])
+    # Multilevel Feedback Queue: quantum of each level, last level is FCFS
+    mlfq_quanta: List[float] = field(default_factory=lambda: [2.0, 4.0])
+
+
+@dataclass
+class GanttSegment:
+    pid: str                 # process id, 'IDLE' or 'CS'
+    start: float
+    end: float
+    kind: str = "run"        # run | idle | cs
+    queue_level: Optional[int] = None
+
+    @property
+    def is_idle(self) -> bool:
+        return self.kind == "idle"
+
+    @property
+    def is_cs(self) -> bool:
+        return self.kind == "cs"
+
+
+@dataclass
+class Step:
+    no: int
+    kind: str                       # run | idle | cs
+    start: float
+    end: float
+    pid: str
+    ready: List[str]                # waiting processes, in queue order
+    remaining: Dict[str, float]     # remaining time of all unfinished arrived processes (before the slice)
+    events: List[str]
+    reason: str
+    outcome: str
+    level: Optional[int] = None
 
 
 @dataclass
@@ -16,921 +80,621 @@ class ProcessResult:
     pid: str
     at: float
     bt: float
-    initial_priority: int
+    priority: int
     final_priority: int
     queue_level: int
     ct: float
     tat: float
     wt: float
     rt: float
+    first_start: float
+    preemptions: int
+    deadline: Optional[float] = None
 
-
-@dataclass
-class GanttSegment:
-    pid: str              # Process ID or 'IDLE'
-    start: float
-    end: float
-    cs_before: bool = False
-    is_idle: bool = False
-    queue_level: Optional[int] = None
+    @property
+    def deadline_met(self) -> Optional[bool]:
+        return None if self.deadline is None else self.ct <= self.deadline + EPS
 
 
 @dataclass
 class ScheduleOutput:
+    key: str
     algorithm: str
     mode: str
     gantt: List[GanttSegment]
-    context_switch_points: List[float]
-    context_switch_count: int
-    total_cs_overhead: float
+    raw_gantt: List[GanttSegment]
+    steps: List[Step]
     results: List[ProcessResult]
+    end_time: float
+    idle_time: float
+    cs_count: int
+    cs_overhead: float
     avg_wt: float
     avg_tat: float
     avg_rt: float
-    avg_bt: float
+    avg_ct: float
     throughput: float
     cpu_utilization: float
-    iteration_logs: List[str]
+    summary: List[str] = field(default_factory=list)
+    options_text: str = ""
+
+    @property
+    def iteration_logs(self) -> List[str]:
+        return [format_step(s) for s in self.steps]
 
 
-def _fmt(val: float) -> str:
-    r = round(float(val), 2)
-    if r == 0:
-        return "0"
+def _fmt(v: float) -> str:
+    r = round(float(v), 2)
     if r == int(r):
         return str(int(r))
-    return f"{r:.2f}".rstrip("0").rstrip(".")
+    return f"{r:g}"
 
 
-def _merge_gantt_segments(raw_segments: List[GanttSegment]) -> List[GanttSegment]:
-    if not raw_segments:
-        return []
-    merged = [
-        GanttSegment(
-            pid=raw_segments[0].pid,
-            start=round(raw_segments[0].start, 4),
-            end=round(raw_segments[0].end, 4),
-            cs_before=raw_segments[0].cs_before,
-            is_idle=(raw_segments[0].pid == "IDLE"),
-            queue_level=raw_segments[0].queue_level,
-        )
-    ]
-    for seg in raw_segments[1:]:
-        prev = merged[-1]
-        if (
-            prev.pid == seg.pid
-            and prev.queue_level == seg.queue_level
-            and not seg.cs_before
-            and abs(prev.end - seg.start) < 1e-6
-        ):
-            prev.end = round(seg.end, 4)
+def format_step(s: Step) -> str:
+    base = f"#{s.no} [{_fmt(s.start)} → {_fmt(s.end)}] {s.pid}: {s.reason}"
+    if s.events:
+        base += " | " + "; ".join(s.events)
+    return base
+
+
+# --------------------------------------------------------------------------- #
+#  Algorithm registry
+# --------------------------------------------------------------------------- #
+@dataclass
+class AlgoInfo:
+    key: str
+    name: str
+    mode: str
+    hue: float          # base colour family (0..1)
+    desc: str
+    uses: str           # which inputs matter
+
+
+ALGOS: List[AlgoInfo] = [
+    AlgoInfo("FCFS", "First Come First Serve (FCFS)", "Non-preemptive", 0.60,
+             "Processes run strictly in order of arrival.", "Arrival, Burst"),
+    AlgoInfo("SJF", "Shortest Job First (SJF)", "Non-preemptive", 0.08,
+             "Among arrived processes the one with the smallest burst runs to completion.", "Arrival, Burst"),
+    AlgoInfo("SRTF", "Shortest Remaining Time First (SRTF)", "Preemptive", 0.00,
+             "Preemptive SJF: the process with the least remaining time always runs.", "Arrival, Burst"),
+    AlgoInfo("LJF", "Longest Job First (LJF)", "Non-preemptive", 0.76,
+             "Among arrived processes the one with the largest burst runs to completion.", "Arrival, Burst"),
+    AlgoInfo("LRTF", "Longest Remaining Time First (LRTF)", "Preemptive", 0.90,
+             "Preemptive LJF: the process with the most remaining time runs (re-checked every 1 unit).", "Arrival, Burst"),
+    AlgoInfo("RR", "Round Robin (RR)", "Preemptive", 0.35,
+             "Each process gets a fixed time quantum in circular order.", "Arrival, Burst, Quantum"),
+    AlgoInfo("PRIO_NP", "Priority Scheduling (Non-preemptive)", "Non-preemptive", 0.50,
+             "Highest-priority arrived process runs to completion. Optional aging.", "Arrival, Burst, Priority"),
+    AlgoInfo("PRIO_P", "Priority Scheduling (Preemptive)", "Preemptive", 0.68,
+             "A higher-priority arrival immediately preempts the running process. Optional aging.", "Arrival, Burst, Priority"),
+    AlgoInfo("PRIO_RR", "Priority + Round Robin", "Preemptive", 0.42,
+             "Highest priority first; equal priorities share the CPU in Round Robin.", "Arrival, Burst, Priority, Quantum"),
+    AlgoInfo("HRRN", "Highest Response Ratio Next (HRRN)", "Non-preemptive", 0.14,
+             "Picks the process with the highest (wait + burst) / burst ratio.", "Arrival, Burst"),
+    AlgoInfo("MLQ", "Multilevel Queue (MLQ)", "Preemptive (between queues)", 0.55,
+             "Fixed queues with strict priority between them; every queue has its own algorithm.",
+             "Arrival, Burst, Queue, Priority"),
+    AlgoInfo("MLFQ", "Multilevel Feedback Queue (MLFQ)", "Preemptive", 0.28,
+             "Processes start in the top queue and are demoted when they use up their quantum.",
+             "Arrival, Burst, Quanta"),
+    AlgoInfo("EDF", "Earliest Deadline First (EDF)", "Preemptive", 0.97,
+             "The process with the nearest deadline runs first.", "Arrival, Burst, Deadline"),
+    AlgoInfo("LOTTERY", "Lottery Scheduling", "Preemptive", 0.17,
+             "Each quantum a random ticket is drawn; tickets depend on priority.", "Arrival, Burst, Priority, Quantum, Seed"),
+    AlgoInfo("STRIDE", "Stride Scheduling", "Preemptive", 0.45,
+             "Deterministic proportional share: smallest 'pass' value runs next.", "Arrival, Burst, Priority, Quantum"),
+]
+ALGO_BY_KEY: Dict[str, AlgoInfo] = {a.key: a for a in ALGOS}
+
+
+# --------------------------------------------------------------------------- #
+#  Colours: each algorithm has a colour family, each process a shade of it
+# --------------------------------------------------------------------------- #
+def algo_color(key: str, lightness: float = 0.45, sat: float = 0.70) -> str:
+    h = ALGO_BY_KEY[key].hue
+    r, g, b = colorsys.hls_to_rgb(h, lightness, sat)
+    return "#%02X%02X%02X" % (int(r * 255), int(g * 255), int(b * 255))
+
+
+def process_colors(key: str, pids: List[str]) -> Dict[str, str]:
+    n = len(pids)
+    out = {}
+    for i, pid in enumerate(pids):
+        frac = i / (n - 1) if n > 1 else 0.5
+        out[pid] = algo_color(key, 0.28 + 0.46 * frac, 0.72)
+    return out
+
+
+def text_color_for(hex_color: str) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return "#FFFFFF" if (0.299 * r + 0.587 * g + 0.114 * b) < 150 else "#111827"
+
+
+# --------------------------------------------------------------------------- #
+#  Simulation state
+# --------------------------------------------------------------------------- #
+class _Sim:
+    def __init__(self, procs: List[ProcessInput], opts: SchedOptions):
+        self.procs = procs
+        self.opts = opts
+        self.byid = {p.pid: p for p in procs}
+        self.n = len(procs)
+        self.rem: Dict[str, float] = {p.pid: float(p.bt) for p in procs}
+        self.pending = sorted(procs, key=lambda p: (p.at, procs.index(p)))
+        self.admitted: List[str] = []
+        self.seq: Dict[str, int] = {}
+        self._seq = 0
+        self.t = 0.0
+        self.segs: List[GanttSegment] = []
+        self.steps: List[Step] = []
+        self.first: Dict[str, float] = {}
+        self.completion: Dict[str, float] = {}
+        self.final_prio: Dict[str, int] = {}
+        self.preempt = {p.pid: 0 for p in procs}
+        self.wait_since: Dict[str, float] = {}
+        self.level: Dict[str, int] = {}
+        self.qleft: Dict[str, float] = {}
+        self.extra: dict = {}
+        self.last: Optional[str] = None
+        self.events: List[str] = []
+        self.done = 0
+        self.cs_count = 0
+
+    # queue helpers
+    def new_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def admit(self, t: float):
+        while self.pending and self.pending[0].at <= t + EPS:
+            p = self.pending.pop(0)
+            self.admitted.append(p.pid)
+            self.seq[p.pid] = self.new_seq()
+            self.wait_since[p.pid] = p.at
+            self.events.append(f"{p.pid} arrived (t={_fmt(p.at)})")
+
+    def ready(self) -> List[str]:
+        return [p for p in self.admitted if self.rem[p] > EPS]
+
+    def ready_ordered(self) -> List[str]:
+        return sorted(self.ready(), key=lambda p: self.seq[p])
+
+    def next_arrival(self, flt: Optional[Callable[[ProcessInput], bool]] = None) -> Optional[float]:
+        for p in self.pending:
+            if flt is None or flt(p):
+                return p.at
+        return None
+
+    def prio(self, pid: str) -> float:
+        base = self.byid[pid].priority
+        if self.opts.aging > 0:
+            gain = int((self.t - self.wait_since[pid] + EPS) // self.opts.aging)
+            base = base + gain if self.opts.high_is_priority else base - gain
+        return base
+
+    def pkey(self, pid: str) -> float:
+        """Sort key where smaller = more urgent."""
+        p = self.prio(pid)
+        return -p if self.opts.high_is_priority else p
+
+    def tickets(self, pid: str) -> int:
+        ps = [q.priority for q in self.procs]
+        if self.opts.high_is_priority:
+            return max(1, int(self.byid[pid].priority) + 1 - min(0, min(ps)))
+        return max(1, int(max(ps) - self.byid[pid].priority + 1))
+
+    # recording
+    def snapshot(self) -> Dict[str, float]:
+        return {p: self.rem[p] for p in self.ready_ordered()}
+
+    def flush_events(self) -> List[str]:
+        ev, self.events = self.events, []
+        return ev
+
+    def add_idle(self, until: float):
+        self.admit(self.t)
+        self.segs.append(GanttSegment("IDLE", self.t, until, "idle"))
+        self.steps.append(Step(len(self.steps) + 1, "idle", self.t, until, "IDLE", [], {},
+                               self.flush_events(),
+                               "No process is ready, CPU stays idle until the next arrival.",
+                               f"CPU idle for {_fmt(until - self.t)} units"))
+        self.t = until
+        self.last = None
+
+    def add_cs(self, cs: float, frm: str, to: str):
+        self.admit(self.t)
+        self.segs.append(GanttSegment("CS", self.t, self.t + cs, "cs"))
+        self.steps.append(Step(len(self.steps) + 1, "cs", self.t, self.t + cs, "CS",
+                               [p for p in self.ready_ordered() if p != to], self.snapshot(),
+                               self.flush_events(),
+                               f"Context switch {frm} → {to} costs {_fmt(cs)} units.",
+                               "Overhead"))
+        self.t += cs
+        self.cs_count += 1
+        self.admit(self.t)
+
+    def run(self, pid: str, L: float, reason: str):
+        self.admit(self.t)
+        snap = self.snapshot()
+        waiting = [p for p in self.ready_ordered() if p != pid]
+        start = self.t
+        end = round(start + L, 6)
+        self.first.setdefault(pid, start)
+        self.rem[pid] = round(self.rem[pid] - L, 6)
+        if self.rem[pid] <= EPS:
+            self.rem[pid] = 0.0
+        self.t = end
+        self.segs.append(GanttSegment(pid, start, end, "run", self.level.get(pid)))
+        fin = self.rem[pid] <= EPS
+        events = self.flush_events()
+        if fin:
+            self.completion[pid] = end
+            self.final_prio[pid] = int(self.prio(pid))
+            self.done += 1
+            outcome = f"{pid} completed at t={_fmt(end)}"
+            self.events.append(f"{pid} completed at t={_fmt(end)}")
         else:
-            merged.append(
-                GanttSegment(
-                    pid=seg.pid,
-                    start=round(seg.start, 4),
-                    end=round(seg.end, 4),
-                    cs_before=seg.cs_before,
-                    is_idle=(seg.pid == "IDLE"),
-                    queue_level=seg.queue_level,
-                )
-            )
-    return merged
+            self.wait_since[pid] = end
+            outcome = f"{pid} ran {_fmt(L)}, remaining {_fmt(self.rem[pid])}"
+        self.steps.append(Step(len(self.steps) + 1, "run", start, end, pid, waiting, snap,
+                               events, reason, outcome, self.level.get(pid)))
+        self.last = pid
 
 
-def _apply_context_switch(
-    current_time: float,
-    last_pid: Optional[str],
-    next_pid: str,
-    cs_enabled: bool,
-    cs_time: float,
-    cs_points: List[float],
-    logs: List[str],
-) -> Tuple[float, int, bool]:
-    if cs_enabled and cs_time > 0 and last_pid is not None and last_pid != next_pid:
-        sw_start = round(current_time, 4)
-        sw_end = round(current_time + cs_time, 4)
-        cs_points.append(sw_start)
-        logs.append(
-            f"  [Context Switch] {last_pid} -> {next_pid} | "
-            f"t={_fmt(sw_start)} -> {_fmt(sw_end)} (+{_fmt(cs_time)})"
-        )
-        return sw_end, 1, True
-    return current_time, 0, False
+# --------------------------------------------------------------------------- #
+#  Policies
+# --------------------------------------------------------------------------- #
+class Policy:
+    def init(self, s: _Sim):
+        pass
+
+    def pick(self, s: _Sim, ready: List[str]) -> Tuple[str, str]:
+        raise NotImplementedError
+
+    def slice(self, s: _Sim, pid: str) -> float:
+        return s.rem[pid]
+
+    def after(self, s: _Sim, pid: str, L: float, fin: bool):
+        pass
 
 
-def _build_output(
-    algorithm: str,
-    mode: str,
-    processes: List[ProcessInput],
-    completion: Dict[str, float],
-    first_start: Dict[str, float],
-    final_prio: Dict[str, int],
-    raw_gantt: List[GanttSegment],
-    cs_points: List[float],
-    cs_count: int,
-    cs_time: float,
-    logs: List[str],
-) -> ScheduleOutput:
-    gantt = _merge_gantt_segments(raw_gantt)
-    results: List[ProcessResult] = []
-    for p in processes:
-        ct = round(completion[p.pid], 2)
+def _why(desc: str, best: str, ready: List[str], val: Callable[[str], str]) -> str:
+    if len(ready) == 1:
+        return f"{best} is the only ready process."
+    others = ", ".join(f"{p}({val(p)})" for p in ready if p != best)
+    return f"{desc}: {best}({val(best)}) beats {others}."
+
+
+class KeyPolicy(Policy):
+    """Pick min(key). Optionally preemptive (re-evaluated at arrivals / unit steps)."""
+
+    def __init__(self, keyf, valf, desc, preemptive=False, unit=None, sticky=False):
+        self.keyf, self.valf, self.desc = keyf, valf, desc
+        self.preemptive, self.unit, self.sticky = preemptive, unit, sticky
+
+    def pick(self, s, ready):
+        order = sorted(ready, key=lambda p: s.seq[p])
+        best = min(order, key=lambda p: (self.keyf(s, p), 0 if (self.sticky and p == s.last) else 1, s.seq[p]))
+        return best, _why(self.desc, best, order, lambda p: self.valf(s, p))
+
+    def slice(self, s, pid):
+        L = s.rem[pid]
+        if self.preemptive:
+            na = s.next_arrival()
+            if na is not None:
+                L = min(L, na - s.t)
+        if self.unit:
+            L = min(L, self.unit)
+        return L
+
+
+class QuantumPolicy(Policy):
+    def __init__(self, q, pickf, arrival_cap=False):
+        self.q, self.pickf, self.arrival_cap = max(q, 0.01), pickf, arrival_cap
+
+    def pick(self, s, ready):
+        return self.pickf(s, ready)
+
+    def slice(self, s, pid):
+        if s.last != pid or s.qleft.get(pid, 0) <= EPS:
+            s.qleft[pid] = self.q
+        L = min(s.qleft[pid], s.rem[pid])
+        if self.arrival_cap:
+            na = s.next_arrival()
+            if na is not None:
+                L = min(L, na - s.t)
+        return L
+
+    def after(self, s, pid, L, fin):
+        s.admit(s.t)  # arrivals enter the queue before the preempted process re-joins
+        s.qleft[pid] = s.qleft.get(pid, 0) - L
+        if not fin and s.qleft[pid] <= EPS:
+            s.seq[pid] = s.new_seq()
+            s.events.append(f"{pid} used its full quantum and goes to the back of the queue")
+        self.post(s, pid, L, fin)
+
+    def post(self, s, pid, L, fin):
+        pass
+
+
+class StridePolicy(QuantumPolicy):
+    def init(self, s):
+        s.extra["pass"] = {p.pid: 0.0 for p in s.procs}
+
+    def post(self, s, pid, L, fin):
+        s.extra["pass"][pid] += (1000.0 / s.tickets(pid)) * (L / self.q)
+
+
+class MultiLevel(Policy):
+    def __init__(self, levels, feedback, opts):
+        self.levels, self.feedback, self.opts = levels, feedback, opts
+
+    def init(self, s):
+        top = len(self.levels) - 1
+        for p in s.procs:
+            s.level[p.pid] = 0 if self.feedback else min(max(int(p.queue_level), 0), top)
+
+    def pick(self, s, ready):
+        lv = min(s.level[p] for p in ready)
+        cand = sorted([p for p in ready if s.level[p] == lv], key=lambda p: s.seq[p])
+        algo = self.levels[lv][0]
+        if algo == "SJF":
+            best = min(cand, key=lambda p: (s.rem[p], s.seq[p]))
+            how = f"shortest job in Q{lv}"
+        elif algo == "PRIORITY":
+            best = min(cand, key=lambda p: (s.pkey(p), s.seq[p]))
+            how = f"highest priority in Q{lv}"
+        else:
+            best = cand[0]
+            how = f"head of Q{lv} ({algo})"
+        return best, f"Q{lv} is the highest non-empty queue; {best} is the {how}."
+
+    def slice(self, s, pid):
+        lv = s.level[pid]
+        algo, q = self.levels[lv]
+        L = s.rem[pid]
+        if algo == "RR" and q > 0:
+            if s.last != pid or s.qleft.get(pid, 0) <= EPS:
+                s.qleft[pid] = q
+            L = min(L, s.qleft[pid])
+        top = len(self.levels) - 1
+        if self.feedback:
+            na = s.next_arrival() if lv > 0 else None
+        else:
+            na = s.next_arrival(lambda p: min(max(int(p.queue_level), 0), top) < lv)
+        if na is not None:
+            L = min(L, na - s.t)
+        return L
+
+    def after(self, s, pid, L, fin):
+        s.admit(s.t)
+        lv = s.level[pid]
+        algo, q = self.levels[lv]
+        if algo == "RR" and q > 0:
+            s.qleft[pid] = s.qleft.get(pid, 0) - L
+            if not fin and s.qleft[pid] <= EPS:
+                if self.feedback and lv < len(self.levels) - 1:
+                    s.level[pid] = lv + 1
+                    s.events.append(f"{pid} used its quantum and is demoted to Q{lv + 1}")
+                else:
+                    s.events.append(f"{pid} used its quantum and goes to the back of Q{lv}")
+                s.seq[pid] = s.new_seq()
+
+
+# --------------------------------------------------------------------------- #
+#  Main loop
+# --------------------------------------------------------------------------- #
+def _simulate(procs: List[ProcessInput], opts: SchedOptions, policy: Policy, key: str) -> ScheduleOutput:
+    s = _Sim(procs, opts)
+    policy.init(s)
+    cs = max(0.0, float(opts.cs_time))
+    guard = 0
+    while s.done < s.n:
+        guard += 1
+        if guard > 100000:
+            raise RuntimeError("Simulation did not terminate (too many steps).")
+        s.admit(s.t)
+        ready = s.ready()
+        if not ready:
+            nxt = s.next_arrival()
+            s.add_idle(nxt)
+            continue
+        pid, reason = policy.pick(s, ready)
+        if s.last is not None and s.last != pid and s.rem[s.last] > EPS:
+            s.preempt[s.last] += 1
+            s.events.append(f"{s.last} was preempted with {_fmt(s.rem[s.last])} left")
+        if cs > 0 and s.last is not None and s.last != pid:
+            s.add_cs(cs, s.last, pid)
+        L = min(policy.slice(s, pid), s.rem[pid])
+        s.run(pid, L, reason)
+        policy.after(s, pid, L, s.rem[pid] <= EPS)
+    return _build_output(s, key, opts)
+
+
+def _merge(raw: List[GanttSegment]) -> List[GanttSegment]:
+    out: List[GanttSegment] = []
+    for g in raw:
+        if out and out[-1].pid == g.pid and out[-1].kind == g.kind and abs(out[-1].end - g.start) < EPS \
+                and g.kind != "cs":
+            out[-1] = GanttSegment(g.pid, out[-1].start, g.end, g.kind, g.queue_level)
+        else:
+            out.append(GanttSegment(g.pid, g.start, g.end, g.kind, g.queue_level))
+    return out
+
+
+def _build_output(s: _Sim, key: str, opts: SchedOptions) -> ScheduleOutput:
+    info = ALGO_BY_KEY[key]
+    results = []
+    for p in s.procs:
+        ct = round(s.completion[p.pid], 2)
         tat = round(ct - p.at, 2)
         wt = round(tat - p.bt, 2)
-        rt = round(first_start[p.pid] - p.at, 2)
-        results.append(
-            ProcessResult(
-                pid=p.pid,
-                at=p.at,
-                bt=p.bt,
-                initial_priority=p.priority,
-                final_priority=final_prio.get(p.pid, p.priority),
-                queue_level=p.queue_level,
-                ct=ct,
-                tat=tat,
-                wt=wt,
-                rt=rt,
-            )
-        )
-
+        rt = round(s.first[p.pid] - p.at, 2)
+        results.append(ProcessResult(p.pid, p.at, p.bt, p.priority, s.final_prio.get(p.pid, p.priority),
+                                     p.queue_level, ct, tat, wt, rt, s.first[p.pid],
+                                     s.preempt[p.pid], p.deadline))
     n = len(results)
-    total_bt = sum(p.bt for p in processes)
-    end_time = max((seg.end for seg in gantt), default=0.0)
-    total_cs_overhead = round(cs_count * cs_time, 2)
-    avg_wt = round(sum(r.wt for r in results) / n, 2) if n else 0.0
-    avg_tat = round(sum(r.tat for r in results) / n, 2) if n else 0.0
-    avg_rt = round(sum(r.rt for r in results) / n, 2) if n else 0.0
-    avg_bt = round(total_bt / n, 2) if n else 0.0
-    throughput = round(n / end_time, 4) if end_time > 0 else 0.0
-    cpu_utilization = round((total_bt / end_time) * 100, 2) if end_time > 0 else 0.0
-
-    return ScheduleOutput(
-        algorithm=algorithm,
-        mode=mode,
-        gantt=gantt,
-        context_switch_points=[round(x, 2) for x in cs_points],
-        context_switch_count=cs_count,
-        total_cs_overhead=total_cs_overhead,
-        results=results,
-        avg_wt=avg_wt,
-        avg_tat=avg_tat,
-        avg_rt=avg_rt,
-        avg_bt=avg_bt,
-        throughput=throughput,
-        cpu_utilization=cpu_utilization,
-        iteration_logs=logs,
+    end = max((g.end for g in s.segs), default=0.0)
+    total_bt = sum(p.bt for p in s.procs)
+    idle = sum(g.end - g.start for g in s.segs if g.kind == "idle")
+    cs_over = sum(g.end - g.start for g in s.segs if g.kind == "cs")
+    avg = lambda f: round(sum(f(r) for r in results) / n, 2) if n else 0.0
+    out = ScheduleOutput(
+        key=key, algorithm=info.name, mode=info.mode, gantt=_merge(s.segs), raw_gantt=s.segs,
+        steps=s.steps, results=results, end_time=round(end, 2), idle_time=round(idle, 2),
+        cs_count=s.cs_count, cs_overhead=round(cs_over, 2),
+        avg_wt=avg(lambda r: r.wt), avg_tat=avg(lambda r: r.tat), avg_rt=avg(lambda r: r.rt),
+        avg_ct=avg(lambda r: r.ct),
+        throughput=round(n / end, 4) if end > 0 else 0.0,
+        cpu_utilization=round(total_bt / end * 100, 2) if end > 0 else 0.0,
+        options_text=_options_text(key, opts),
     )
-
-
-def run_fcfs(
-    processes: List[ProcessInput], cs_enabled: bool = False, cs_time: float = 0.0
-) -> ScheduleOutput:
-    procs = sorted(processes, key=lambda p: (p.at, p.pid))
-    t = 0.0
-    last_pid: Optional[str] = None
-    gantt, cs_points = [], []
-    cs_count = 0
-    completion, first_start, final_prio = {}, {}, {p.pid: p.priority for p in procs}
-    logs = [
-        f"=== FCFS (Non-Preemptive{f', CS={_fmt(cs_time)}' if cs_enabled and cs_time > 0 else ''}) ==="
-    ]
-
-    for step, p in enumerate(procs, start=1):
-        if t < p.at:
-            gantt.append(GanttSegment(pid="IDLE", start=t, end=p.at, is_idle=True))
-            logs.append(f"Idle | t={_fmt(t)}->{_fmt(p.at)}: CPU IDLE")
-            t = p.at
-        t, added_cs, had_cs = _apply_context_switch(
-            t, last_pid, p.pid, cs_enabled, cs_time, cs_points, logs
-        )
-        cs_count += added_cs
-        start_t, end_t = t, round(t + p.bt, 4)
-        first_start[p.pid], completion[p.pid] = start_t, end_t
-        gantt.append(GanttSegment(pid=p.pid, start=start_t, end=end_t, cs_before=had_cs))
-        tat, wt, rt = end_t - p.at, (end_t - p.at) - p.bt, start_t - p.at
-        logs.append(
-            f"Step {step} | t={_fmt(start_t)}->{_fmt(end_t)}: {p.pid} "
-            f"(AT={_fmt(p.at)}, BT={_fmt(p.bt)}) | "
-            f"CT={_fmt(end_t)}, TAT={_fmt(tat)}, WT={_fmt(wt)}, RT={_fmt(rt)}"
-        )
-        t, last_pid = end_t, p.pid
-
-    return _build_output(
-        "FCFS",
-        "Non-Preemptive",
-        processes,
-        completion,
-        first_start,
-        final_prio,
-        gantt,
-        cs_points,
-        cs_count,
-        cs_time if cs_enabled else 0.0,
-        logs,
-    )
-
-
-def run_sjf_non_preemptive(
-    processes: List[ProcessInput], cs_enabled: bool = False, cs_time: float = 0.0
-) -> ScheduleOutput:
-    remaining = list(processes)
-    t = 0.0
-    last_pid: Optional[str] = None
-    gantt, cs_points = [], []
-    cs_count = 0
-    completion, first_start, final_prio = {}, {}, {p.pid: p.priority for p in processes}
-    logs = [
-        f"=== SJF (Non-Preemptive{f', CS={_fmt(cs_time)}' if cs_enabled and cs_time > 0 else ''}) ==="
-    ]
-    step = 1
-
-    while remaining:
-        ready = [p for p in remaining if p.at <= t + 1e-9]
-        if not ready:
-            next_at = min(p.at for p in remaining)
-            gantt.append(GanttSegment(pid="IDLE", start=t, end=next_at, is_idle=True))
-            logs.append(f"Idle | t={_fmt(t)}->{_fmt(next_at)}: CPU IDLE")
-            t = next_at
-            continue
-
-        chosen = min(ready, key=lambda p: (p.bt, p.at, p.pid))
-        remaining.remove(chosen)
-        t, added_cs, had_cs = _apply_context_switch(
-            t, last_pid, chosen.pid, cs_enabled, cs_time, cs_points, logs
-        )
-        cs_count += added_cs
-        start_t, end_t = t, round(t + chosen.bt, 4)
-        first_start[chosen.pid], completion[chosen.pid] = start_t, end_t
-        gantt.append(
-            GanttSegment(pid=chosen.pid, start=start_t, end=end_t, cs_before=had_cs)
-        )
-        tat, wt, rt = end_t - chosen.at, (end_t - chosen.at) - chosen.bt, start_t - chosen.at
-        logs.append(
-            f"Step {step} | t={_fmt(start_t)}->{_fmt(end_t)}: Selected {chosen.pid} "
-            f"(BT={_fmt(chosen.bt)}) | CT={_fmt(end_t)}, TAT={_fmt(tat)}, WT={_fmt(wt)}, RT={_fmt(rt)}"
-        )
-        t, last_pid, step = end_t, chosen.pid, step + 1
-
-    return _build_output(
-        "SJF",
-        "Non-Preemptive",
-        processes,
-        completion,
-        first_start,
-        final_prio,
-        gantt,
-        cs_points,
-        cs_count,
-        cs_time if cs_enabled else 0.0,
-        logs,
-    )
-
-
-def run_srtf_preemptive(
-    processes: List[ProcessInput],
-    cs_enabled: bool = False,
-    cs_time: float = 0.0,
-    tick: float = 1.0,
-) -> ScheduleOutput:
-    rem_bt = {p.pid: p.bt for p in processes}
-    completed = set()
-    n = len(processes)
-    t = 0.0
-    last_pid: Optional[str] = None
-    gantt, cs_points = [], []
-    cs_count = 0
-    completion, first_start, final_prio = {}, {}, {p.pid: p.priority for p in processes}
-    logs = [
-        f"=== SRTF / Preemptive SJF (tick={_fmt(tick)}{f', CS={_fmt(cs_time)}' if cs_enabled and cs_time > 0 else ''}) ==="
-    ]
-
-    while len(completed) < n:
-        ready = [
-            p for p in processes if p.pid not in completed and p.at <= t + 1e-9
-        ]
-        if not ready:
-            next_at = min(p.at for p in processes if p.pid not in completed)
-            gantt.append(GanttSegment(pid="IDLE", start=t, end=next_at, is_idle=True))
-            logs.append(f"Idle | t={_fmt(t)}->{_fmt(next_at)}: CPU IDLE")
-            t = next_at
-            continue
-
-        chosen = min(
-            ready,
-            key=lambda p: (
-                rem_bt[p.pid],
-                0 if p.pid == last_pid else 1,
-                p.at,
-                p.pid,
-            ),
-        )
-        t, added_cs, had_cs = _apply_context_switch(
-            t, last_pid, chosen.pid, cs_enabled, cs_time, cs_points, logs
-        )
-        cs_count += added_cs
-        if chosen.pid not in first_start:
-            first_start[chosen.pid] = t
-
-        future_arrivals = [
-            p.at
-            for p in processes
-            if p.pid not in completed and p.at > t + 1e-9
-        ]
-        if future_arrivals:
-            next_event = min(future_arrivals)
-            run_for = round(min(rem_bt[chosen.pid], next_event - t), 4)
-        else:
-            run_for = rem_bt[chosen.pid]
-
-        start_t, end_t = t, round(t + run_for, 4)
-        rem_bt[chosen.pid] = round(rem_bt[chosen.pid] - run_for, 4)
-        gantt.append(
-            GanttSegment(pid=chosen.pid, start=start_t, end=end_t, cs_before=had_cs)
-        )
-        if rem_bt[chosen.pid] <= 1e-6:
-            rem_bt[chosen.pid] = 0.0
-            completed.add(chosen.pid)
-            completion[chosen.pid] = end_t
-            tat, wt, rt = (
-                end_t - chosen.at,
-                (end_t - chosen.at) - chosen.bt,
-                first_start[chosen.pid] - chosen.at,
-            )
-            logs.append(
-                f"t={_fmt(start_t)}->{_fmt(end_t)}: {chosen.pid} COMPLETED | "
-                f"CT={_fmt(end_t)}, TAT={_fmt(tat)}, WT={_fmt(wt)}, RT={_fmt(rt)}"
-            )
-        else:
-            logs.append(
-                f"t={_fmt(start_t)}->{_fmt(end_t)}: {chosen.pid} ran "
-                f"(rem BT={_fmt(rem_bt[chosen.pid])})"
-            )
-        t, last_pid = end_t, chosen.pid
-
-    return _build_output(
-        "SRTF",
-        "Preemptive",
-        processes,
-        completion,
-        first_start,
-        final_prio,
-        gantt,
-        cs_points,
-        cs_count,
-        cs_time if cs_enabled else 0.0,
-        logs,
-    )
-
-
-def run_priority_non_preemptive(
-    processes: List[ProcessInput],
-    aging_enabled: bool = False,
-    aging_interval: float = 4.0,
-    cs_enabled: bool = False,
-    cs_time: float = 0.0,
-) -> ScheduleOutput:
-    remaining = list(processes)
-    t = 0.0
-    last_pid: Optional[str] = None
-    gantt, cs_points = [], []
-    cs_count = 0
-    completion, first_start = {}, {}
-    final_prio = {p.pid: p.priority for p in processes}
-    mode_label = (
-        f"Non-Preemptive{' + Aging(interval=' + _fmt(aging_interval) + ')' if aging_enabled else ''}"
-    )
-    logs = [
-        f"=== Priority Scheduling ({mode_label}{f', CS={_fmt(cs_time)}' if cs_enabled and cs_time > 0 else ''}) ==="
-    ]
-    iteration = 1
-
-    while remaining:
-        ready = [p for p in remaining if p.at <= t + 1e-9]
-        if not ready:
-            next_at = min(p.at for p in remaining)
-            gantt.append(GanttSegment(pid="IDLE", start=t, end=next_at, is_idle=True))
-            logs.append(f"Idle | t={_fmt(t)}->{_fmt(next_at)}: CPU IDLE")
-            t = next_at
-            continue
-
-        scored, iter_rows = [], []
-        for p in ready:
-            wt_so_far = max(0.0, t - p.at)
-            aging_val = (
-                int(wt_so_far // aging_interval)
-                if (aging_enabled and aging_interval > 0)
-                else 0
-            )
-            eff_prio = max(0, p.priority - aging_val)
-            final_prio[p.pid] = eff_prio
-            scored.append((eff_prio, p.at, p.pid, p))
-            if aging_enabled:
-                iter_rows.append(
-                    f"  {p.pid}: IP={p.priority}, WT={_fmt(wt_so_far)}, "
-                    f"Aging=floor({_fmt(wt_so_far)}/{_fmt(aging_interval)})={aging_val}, "
-                    f"Effective={eff_prio}"
-                )
-            else:
-                iter_rows.append(
-                    f"  {p.pid}: Priority={p.priority}, AT={_fmt(p.at)}, BT={_fmt(p.bt)}"
-                )
-
-        scored.sort(key=lambda x: (x[0], x[1], x[2]))
-        eff_prio, _, _, chosen = scored[0]
-        remaining.remove(chosen)
-        logs.append(f"Iteration {iteration} (at t={_fmt(t)}):")
-        logs.extend(iter_rows)
-
-        t, added_cs, had_cs = _apply_context_switch(
-            t, last_pid, chosen.pid, cs_enabled, cs_time, cs_points, logs
-        )
-        cs_count += added_cs
-        start_t, end_t = t, round(t + chosen.bt, 4)
-        first_start[chosen.pid], completion[chosen.pid] = start_t, end_t
-        gantt.append(
-            GanttSegment(pid=chosen.pid, start=start_t, end=end_t, cs_before=had_cs)
-        )
-        tat, wt, rt = end_t - chosen.at, (end_t - chosen.at) - chosen.bt, start_t - chosen.at
-        logs.append(
-            f"  -> Selected {chosen.pid} (Effective Priority={eff_prio}) | "
-            f"t={_fmt(start_t)}->{_fmt(end_t)} | CT={_fmt(end_t)}, TAT={_fmt(tat)}, "
-            f"WT={_fmt(wt)}, RT={_fmt(rt)}"
-        )
-        t, last_pid, iteration = end_t, chosen.pid, iteration + 1
-
-    return _build_output(
-        "Priority",
-        mode_label,
-        processes,
-        completion,
-        first_start,
-        final_prio,
-        gantt,
-        cs_points,
-        cs_count,
-        cs_time if cs_enabled else 0.0,
-        logs,
-    )
-
-
-def run_priority_preemptive(
-    processes: List[ProcessInput],
-    aging_enabled: bool = False,
-    aging_interval: float = 3.0,
-    cs_enabled: bool = False,
-    cs_time: float = 0.0,
-) -> ScheduleOutput:
-    rem_bt = {p.pid: p.bt for p in processes}
-    wait_accum = {p.pid: 0.0 for p in processes}
-    eff_prio = {p.pid: p.priority for p in processes}
-    completed = set()
-    n = len(processes)
-    t = 0.0
-    last_pid: Optional[str] = None
-    gantt, cs_points = [], []
-    cs_count = 0
-    completion, first_start = {}, {}
-    mode_label = (
-        f"Preemptive{' + Aging(interval=' + _fmt(aging_interval) + ')' if aging_enabled else ''}"
-    )
-    logs = [
-        f"=== Priority Scheduling ({mode_label}{f', CS={_fmt(cs_time)}' if cs_enabled and cs_time > 0 else ''}) ==="
-    ]
-
-    while len(completed) < n:
-        ready = [
-            p for p in processes if p.pid not in completed and p.at <= t + 1e-9
-        ]
-        if not ready:
-            next_at = min(p.at for p in processes if p.pid not in completed)
-            gantt.append(GanttSegment(pid="IDLE", start=t, end=next_at, is_idle=True))
-            logs.append(f"Idle | t={_fmt(t)}->{_fmt(next_at)}: CPU IDLE")
-            t = next_at
-            continue
-
-        for p in ready:
-            if aging_enabled and aging_interval > 0:
-                eff_prio[p.pid] = max(
-                    0, p.priority - int(wait_accum[p.pid] // aging_interval)
-                )
-            else:
-                eff_prio[p.pid] = p.priority
-
-        chosen = min(
-            ready,
-            key=lambda p: (
-                eff_prio[p.pid],
-                0 if p.pid == last_pid else 1,
-                p.at,
-                p.pid,
-            ),
-        )
-        prev_t = t
-        t, added_cs, had_cs = _apply_context_switch(
-            t, last_pid, chosen.pid, cs_enabled, cs_time, cs_points, logs
-        )
-        cs_count += added_cs
-        cs_dt = round(t - prev_t, 4)
-        if cs_dt > 0 and aging_enabled:
-            for p in ready:
-                if p.pid != chosen.pid:
-                    wait_accum[p.pid] = round(wait_accum[p.pid] + cs_dt, 4)
-
-        if chosen.pid not in first_start:
-            first_start[chosen.pid] = t
-
-        future_arrivals = [
-            p.at
-            for p in processes
-            if p.pid not in completed and p.at > t + 1e-9
-        ]
-        step_dt = min(1.0, rem_bt[chosen.pid])
-        if future_arrivals:
-            step_dt = min(step_dt, round(min(future_arrivals) - t, 4))
-        step_dt = max(1e-4, round(step_dt, 4))
-
-        start_t, end_t = t, round(t + step_dt, 4)
-        rem_bt[chosen.pid] = round(rem_bt[chosen.pid] - step_dt, 4)
-        for p in ready:
-            if p.pid != chosen.pid:
-                wait_accum[p.pid] = round(wait_accum[p.pid] + step_dt, 4)
-
-        gantt.append(
-            GanttSegment(pid=chosen.pid, start=start_t, end=end_t, cs_before=had_cs)
-        )
-        if rem_bt[chosen.pid] <= 1e-6:
-            rem_bt[chosen.pid] = 0.0
-            completed.add(chosen.pid)
-            completion[chosen.pid] = end_t
-            tat, wt, rt = (
-                end_t - chosen.at,
-                (end_t - chosen.at) - chosen.bt,
-                first_start[chosen.pid] - chosen.at,
-            )
-            logs.append(
-                f"t={_fmt(start_t)}->{_fmt(end_t)}: {chosen.pid} "
-                f"(Prio={eff_prio[chosen.pid]}) COMPLETED | "
-                f"CT={_fmt(end_t)}, TAT={_fmt(tat)}, WT={_fmt(wt)}, RT={_fmt(rt)}"
-            )
-        else:
-            logs.append(
-                f"t={_fmt(start_t)}->{_fmt(end_t)}: {chosen.pid} "
-                f"(Prio={eff_prio[chosen.pid]}) ran (rem BT={_fmt(rem_bt[chosen.pid])})"
-            )
-        t, last_pid = end_t, chosen.pid
-
-    return _build_output(
-        "Priority",
-        mode_label,
-        processes,
-        completion,
-        first_start,
-        eff_prio,
-        gantt,
-        cs_points,
-        cs_count,
-        cs_time if cs_enabled else 0.0,
-        logs,
-    )
-
-
-def run_round_robin(
-    processes: List[ProcessInput],
-    quantum: float = 2.0,
-    cs_enabled: bool = False,
-    cs_time: float = 0.0,
-) -> ScheduleOutput:
-    if quantum <= 0:
-        raise ValueError("Time quantum must be greater than 0.")
-
-    procs = sorted(processes, key=lambda p: (p.at, p.pid))
-    rem_bt = {p.pid: p.bt for p in procs}
-    arrived, completed = set(), set()
-    ready_queue: List[ProcessInput] = []
-    n = len(procs)
-    t = 0.0
-    last_pid: Optional[str] = None
-    gantt, cs_points = [], []
-    cs_count = 0
-    completion, first_start, final_prio = {}, {}, {p.pid: p.priority for p in procs}
-    logs = [
-        f"=== Round Robin (Quantum={_fmt(quantum)}{f', CS={_fmt(cs_time)}' if cs_enabled and cs_time > 0 else ''}) ==="
-    ]
-
-    def enqueue_arrivals(up_to_t: float):
-        for p in procs:
-            if p.pid not in arrived and p.at <= up_to_t + 1e-9:
-                ready_queue.append(p)
-                arrived.add(p.pid)
-
-    enqueue_arrivals(t)
-    step = 1
-    while len(completed) < n:
-        if not ready_queue:
-            next_at = min(p.at for p in procs if p.pid not in arrived)
-            gantt.append(GanttSegment(pid="IDLE", start=t, end=next_at, is_idle=True))
-            logs.append(f"Idle | t={_fmt(t)}->{_fmt(next_at)}: CPU IDLE")
-            t = next_at
-            enqueue_arrivals(t)
-            continue
-
-        chosen = ready_queue.pop(0)
-        t, added_cs, had_cs = _apply_context_switch(
-            t, last_pid, chosen.pid, cs_enabled, cs_time, cs_points, logs
-        )
-        cs_count += added_cs
-        enqueue_arrivals(t)
-        if chosen.pid not in first_start:
-            first_start[chosen.pid] = t
-
-        run_for = min(quantum, rem_bt[chosen.pid])
-        start_t, end_t = t, round(t + run_for, 4)
-        rem_bt[chosen.pid] = round(rem_bt[chosen.pid] - run_for, 4)
-        gantt.append(
-            GanttSegment(pid=chosen.pid, start=start_t, end=end_t, cs_before=had_cs)
-        )
-        t = end_t
-        enqueue_arrivals(t)
-
-        if rem_bt[chosen.pid] <= 1e-6:
-            rem_bt[chosen.pid] = 0.0
-            completed.add(chosen.pid)
-            completion[chosen.pid] = end_t
-            tat, wt, rt = (
-                end_t - chosen.at,
-                (end_t - chosen.at) - chosen.bt,
-                first_start[chosen.pid] - chosen.at,
-            )
-            logs.append(
-                f"Step {step} | t={_fmt(start_t)}->{_fmt(end_t)}: {chosen.pid} COMPLETED | "
-                f"CT={_fmt(end_t)}, TAT={_fmt(tat)}, WT={_fmt(wt)}, RT={_fmt(rt)}"
-            )
-        else:
-            ready_queue.append(chosen)
-            logs.append(
-                f"Step {step} | t={_fmt(start_t)}->{_fmt(end_t)}: {chosen.pid} "
-                f"ran {_fmt(run_for)} (rem BT={_fmt(rem_bt[chosen.pid])})"
-            )
-        last_pid, step = chosen.pid, step + 1
-
-    return _build_output(
-        "Round Robin",
-        f"Preemptive (Q={_fmt(quantum)})",
-        processes,
-        completion,
-        first_start,
-        final_prio,
-        gantt,
-        cs_points,
-        cs_count,
-        cs_time if cs_enabled else 0.0,
-        logs,
-    )
-
-
-def run_hrrn(
-    processes: List[ProcessInput], cs_enabled: bool = False, cs_time: float = 0.0
-) -> ScheduleOutput:
-    remaining = list(processes)
-    t = 0.0
-    last_pid: Optional[str] = None
-    gantt, cs_points = [], []
-    cs_count = 0
-    completion, first_start, final_prio = {}, {}, {p.pid: p.priority for p in processes}
-    logs = [
-        f"=== HRRN (Non-Preemptive{f', CS={_fmt(cs_time)}' if cs_enabled and cs_time > 0 else ''}) ==="
-    ]
-    iteration = 1
-
-    while remaining:
-        ready = [p for p in remaining if p.at <= t + 1e-9]
-        if not ready:
-            next_at = min(p.at for p in remaining)
-            gantt.append(GanttSegment(pid="IDLE", start=t, end=next_at, is_idle=True))
-            logs.append(f"Idle | t={_fmt(t)}->{_fmt(next_at)}: CPU IDLE")
-            t = next_at
-            continue
-
-        ratios = []
-        logs.append(f"Iteration {iteration} (at t={_fmt(t)}):")
-        for p in ready:
-            wt_so_far = max(0.0, t - p.at)
-            rr = (wt_so_far + p.bt) / p.bt
-            ratios.append((rr, p.at, p.pid, p, wt_so_far))
-            logs.append(
-                f"  {p.pid}: WT={_fmt(wt_so_far)}, BT={_fmt(p.bt)}, "
-                f"RR = ({_fmt(wt_so_far)} + {_fmt(p.bt)}) / {_fmt(p.bt)} = {rr:.2f}"
-            )
-
-        ratios.sort(key=lambda x: (-x[0], x[1], x[2]))
-        best_rr, _, _, chosen, _ = ratios[0]
-        remaining.remove(chosen)
-
-        t, added_cs, had_cs = _apply_context_switch(
-            t, last_pid, chosen.pid, cs_enabled, cs_time, cs_points, logs
-        )
-        cs_count += added_cs
-        start_t, end_t = t, round(t + chosen.bt, 4)
-        first_start[chosen.pid], completion[chosen.pid] = start_t, end_t
-        gantt.append(
-            GanttSegment(pid=chosen.pid, start=start_t, end=end_t, cs_before=had_cs)
-        )
-        tat, wt, rt = end_t - chosen.at, (end_t - chosen.at) - chosen.bt, start_t - chosen.at
-        logs.append(
-            f"  -> Selected {chosen.pid} (Highest RR={best_rr:.2f}) | "
-            f"t={_fmt(start_t)}->{_fmt(end_t)} | CT={_fmt(end_t)}, TAT={_fmt(tat)}, "
-            f"WT={_fmt(wt)}, RT={_fmt(rt)}"
-        )
-        t, last_pid, iteration = end_t, chosen.pid, iteration + 1
-
-    return _build_output(
-        "HRRN",
-        "Non-Preemptive",
-        processes,
-        completion,
-        first_start,
-        final_prio,
-        gantt,
-        cs_points,
-        cs_count,
-        cs_time if cs_enabled else 0.0,
-        logs,
-    )
-
-
-def run_multilevel_queue(
-    processes: List[ProcessInput],
-    q0_policy: str = "RR",
-    q0_quantum: float = 2.0,
-    q1_policy: str = "FCFS",
-    q1_quantum: float = 4.0,
-    cs_enabled: bool = False,
-    cs_time: float = 0.0,
-) -> ScheduleOutput:
-    """
-    Multi-Level Queue (MLQ) Scheduling:
-    - Queue 0 (Foreground/High): runs 'RR' or 'FCFS' (preemptive over lower queues)
-    - Queue 1 (Background/Low): runs 'FCFS', 'SJF', or 'RR' when Q0 is empty
-    """
-    if q0_policy.upper() == "RR" and q0_quantum <= 0:
-        raise ValueError("Queue 0 Quantum must be greater than 0.")
-    if q1_policy.upper() == "RR" and q1_quantum <= 0:
-        raise ValueError("Queue 1 Quantum must be greater than 0.")
-
-    rem_bt = {p.pid: p.bt for p in processes}
-    completed = set()
-    n = len(processes)
-    t = 0.0
-    last_pid: Optional[str] = None
-    gantt, cs_points = [], []
-    cs_count = 0
-    completion, first_start = {}, {}
-    final_prio = {p.pid: p.priority for p in processes}
-    rr_q0: List[str] = []
-    rr_q1: List[str] = []
-    known_arrived = set()
-
-    q0_desc = f"RR(Q={_fmt(q0_quantum)})" if q0_policy.upper() == "RR" else "FCFS"
-    q1_desc = f"RR(Q={_fmt(q1_quantum)})" if q1_policy.upper() == "RR" else q1_policy.upper()
-    mode_label = (
-        f"MLQ (Q0={q0_desc}, Q1={q1_desc}"
-        f"{f', CS={_fmt(cs_time)}' if cs_enabled and cs_time > 0 else ''})"
-    )
-    logs = [f"=== Multi-Level Queue ({mode_label}) ==="]
-
-    def sync_arrivals(now_t: float):
-        for p in sorted(processes, key=lambda x: (x.at, x.pid)):
-            if (
-                p.pid not in completed
-                and p.pid not in known_arrived
-                and p.at <= now_t + 1e-9
-            ):
-                known_arrived.add(p.pid)
-                if p.queue_level == 0 and p.pid not in rr_q0:
-                    rr_q0.append(p.pid)
-                elif p.queue_level != 0 and p.pid not in rr_q1:
-                    rr_q1.append(p.pid)
-
-    sync_arrivals(t)
-    proc_map = {p.pid: p for p in processes}
-
-    while len(completed) < n:
-        sync_arrivals(t)
-        ready_q0 = [pid for pid in rr_q0 if pid not in completed]
-        ready_q1 = [pid for pid in rr_q1 if pid not in completed]
-
-        if not ready_q0 and not ready_q1:
-            rem_procs = [p for p in processes if p.pid not in completed]
-            next_at = min(p.at for p in rem_procs)
-            gantt.append(GanttSegment(pid="IDLE", start=t, end=next_at, is_idle=True))
-            logs.append(f"Idle | t={_fmt(t)}->{_fmt(next_at)}: CPU IDLE")
-            t = next_at
-            sync_arrivals(t)
-            continue
-
-        if ready_q0:
-            q_level = 0
-            if q0_policy.upper() == "RR":
-                chosen_id = ready_q0[0]
-                rr_q0.remove(chosen_id)
-                slice_len = min(q0_quantum, rem_bt[chosen_id])
-            else:
-                chosen_id = min(ready_q0, key=lambda pid: (proc_map[pid].at, pid))
-                rr_q0.remove(chosen_id)
-                slice_len = rem_bt[chosen_id]
-        else:
-            q_level = 1
-            pol1 = q1_policy.upper()
-            if pol1 == "RR":
-                chosen_id = ready_q1[0]
-                rr_q1.remove(chosen_id)
-                slice_len = min(q1_quantum, rem_bt[chosen_id])
-            elif pol1 == "SJF":
-                chosen_id = min(
-                    ready_q1, key=lambda pid: (rem_bt[pid], proc_map[pid].at, pid)
-                )
-                rr_q1.remove(chosen_id)
-                slice_len = rem_bt[chosen_id]
-            else:
-                chosen_id = min(ready_q1, key=lambda pid: (proc_map[pid].at, pid))
-                rr_q1.remove(chosen_id)
-                slice_len = rem_bt[chosen_id]
-
-        chosen = proc_map[chosen_id]
-        t, added_cs, had_cs = _apply_context_switch(
-            t, last_pid, chosen.pid, cs_enabled, cs_time, cs_points, logs
-        )
-        cs_count += added_cs
-        sync_arrivals(t)
-
-        if chosen.pid not in first_start:
-            first_start[chosen.pid] = t
-
-        # Preempt Q1 immediately if a Q0 process arrives mid-burst
-        if q_level == 1:
-            future_q0 = [
-                p.at
-                for p in processes
-                if p.pid not in completed
-                and p.queue_level == 0
-                and t + 1e-9 < p.at < t + slice_len - 1e-9
-            ]
-            if future_q0:
-                slice_len = min(future_q0) - t
-
-        slice_len = round(slice_len, 4)
-        start_t, end_t = t, round(t + slice_len, 4)
-        rem_bt[chosen.pid] = round(rem_bt[chosen.pid] - slice_len, 4)
-        gantt.append(
-            GanttSegment(
-                pid=chosen.pid,
-                start=start_t,
-                end=end_t,
-                cs_before=had_cs,
-                queue_level=q_level,
-            )
-        )
-        t = end_t
-        sync_arrivals(t)
-
-        if rem_bt[chosen.pid] <= 1e-6:
-            rem_bt[chosen.pid] = 0.0
-            completed.add(chosen.pid)
-            completion[chosen.pid] = end_t
-            tat, wt, rt = (
-                end_t - chosen.at,
-                (end_t - chosen.at) - chosen.bt,
-                first_start[chosen.pid] - chosen.at,
-            )
-            logs.append(
-                f"[Q{q_level}] t={_fmt(start_t)}->{_fmt(end_t)}: {chosen.pid} COMPLETED | "
-                f"CT={_fmt(end_t)}, TAT={_fmt(tat)}, WT={_fmt(wt)}, RT={_fmt(rt)}"
-            )
-        else:
-            if q_level == 0 and q0_policy.upper() == "RR" and chosen.pid not in rr_q0:
-                rr_q0.append(chosen.pid)
-            elif q_level == 1 and q1_policy.upper() == "RR" and chosen.pid not in rr_q1:
-                rr_q1.append(chosen.pid)
-            elif q_level == 1 and chosen.pid not in rr_q1:
-                rr_q1.insert(0, chosen.pid)
-            logs.append(
-                f"[Q{q_level}] t={_fmt(start_t)}->{_fmt(end_t)}: {chosen.pid} "
-                f"ran {_fmt(slice_len)} (rem BT={_fmt(rem_bt[chosen.pid])})"
-            )
-
-        last_pid = chosen.pid
-
-    return _build_output(
-        "Multi-Level Queue",
-        mode_label,
-        processes,
-        completion,
-        first_start,
-        final_prio,
-        gantt,
-        cs_points,
-        cs_count,
-        cs_time if cs_enabled else 0.0,
-        logs,
-    )
+    out.summary = build_summary(out)
+    return out
+
+
+def _options_text(key: str, o: SchedOptions) -> str:
+    parts = []
+    if key in ("RR", "PRIO_RR", "LOTTERY", "STRIDE"):
+        parts.append(f"Time quantum = {_fmt(o.quantum)}")
+    if key in ("PRIO_NP", "PRIO_P", "PRIO_RR", "LOTTERY", "STRIDE", "MLQ"):
+        parts.append("Higher number = higher priority" if o.high_is_priority
+                     else "Lower number = higher priority")
+    if key in ("PRIO_NP", "PRIO_P", "PRIO_RR") and o.aging > 0:
+        parts.append(f"Aging every {_fmt(o.aging)} units")
+    if key == "MLQ":
+        parts.append("Queues: " + ", ".join(
+            f"Q{i}={a}" + (f"(q={_fmt(q)})" if a == "RR" else "") for i, (a, q) in enumerate(o.mlq_levels)))
+    if key == "MLFQ":
+        parts.append("Quanta: " + ", ".join(_fmt(q) for q in o.mlfq_quanta) + ", last queue FCFS")
+    if key == "LOTTERY":
+        parts.append(f"Seed = {o.seed}")
+    parts.append(f"Context switch = {_fmt(o.cs_time)}")
+    return " · ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+#  Narrative summary
+# --------------------------------------------------------------------------- #
+def build_summary(o: ScheduleOutput) -> List[str]:
+    L = []
+    order = [g.pid for g in o.gantt if g.kind == "run"]
+    L.append(f"{o.algorithm} ({o.mode}) scheduled {len(o.results)} processes and finished everything at t={_fmt(o.end_time)}.")
+    L.append("Execution order: " + " → ".join(order))
+    for r in o.results:
+        txt = (f"{r.pid}: arrived at {_fmt(r.at)}, first got the CPU at {_fmt(r.first_start)} "
+               f"(response time {_fmt(r.rt)}), needed {_fmt(r.bt)} units, finished at {_fmt(r.ct)}. "
+               f"It waited {_fmt(r.wt)} units in total and its turnaround time was {_fmt(r.tat)}.")
+        if r.preemptions:
+            txt += f" It was preempted {r.preemptions} time(s)."
+        if r.deadline is not None:
+            txt += " Deadline " + (f"met ({_fmt(r.deadline)})." if r.deadline_met else f"MISSED ({_fmt(r.deadline)}).")
+        L.append(txt)
+    if o.results:
+        w = max(o.results, key=lambda r: r.wt)
+        b = min(o.results, key=lambda r: r.wt)
+        L.append(f"Longest waiting process: {w.pid} ({_fmt(w.wt)}). Shortest waiting process: {b.pid} ({_fmt(b.wt)}).")
+    L.append(f"Average waiting time {_fmt(o.avg_wt)}, average turnaround time {_fmt(o.avg_tat)}, "
+             f"average response time {_fmt(o.avg_rt)}.")
+    L.append(f"CPU utilization {_fmt(o.cpu_utilization)}%, throughput {o.throughput:g} processes/unit, "
+             f"idle time {_fmt(o.idle_time)}, context switches {o.cs_count} (overhead {_fmt(o.cs_overhead)}).")
+    return L
+
+
+# --------------------------------------------------------------------------- #
+#  Public API
+# --------------------------------------------------------------------------- #
+def run_algorithm(key: str, procs: List[ProcessInput], opts: Optional[SchedOptions] = None) -> ScheduleOutput:
+    opts = opts or SchedOptions()
+    if not procs:
+        raise ValueError("Add at least one process.")
+    q = opts.quantum
+    last_pref = lambda s, p: p
+    if key == "FCFS":
+        pol = KeyPolicy(lambda s, p: s.seq[p], lambda s, p: f"arrived {_fmt(s.byid[p].at)}", "Earliest arrival")
+    elif key == "SJF":
+        pol = KeyPolicy(lambda s, p: s.byid[p].bt, lambda s, p: _fmt(s.byid[p].bt), "Smallest burst")
+    elif key == "SRTF":
+        pol = KeyPolicy(lambda s, p: s.rem[p], lambda s, p: _fmt(s.rem[p]), "Least remaining time",
+                        preemptive=True, sticky=True)
+    elif key == "LJF":
+        pol = KeyPolicy(lambda s, p: -s.byid[p].bt, lambda s, p: _fmt(s.byid[p].bt), "Largest burst")
+    elif key == "LRTF":
+        pol = KeyPolicy(lambda s, p: -s.rem[p], lambda s, p: _fmt(s.rem[p]), "Most remaining time",
+                        preemptive=True, unit=1.0, sticky=True)
+    elif key == "RR":
+        pol = QuantumPolicy(q, lambda s, r: (min(r, key=lambda p: s.seq[p]),
+                                             "Head of the circular ready queue."))
+    elif key == "PRIO_NP":
+        pol = KeyPolicy(lambda s, p: s.pkey(p), lambda s, p: _fmt(s.prio(p)), "Best priority")
+    elif key == "PRIO_P":
+        pol = KeyPolicy(lambda s, p: s.pkey(p), lambda s, p: _fmt(s.prio(p)), "Best priority",
+                        preemptive=True, unit=1.0 if opts.aging > 0 else None, sticky=True)
+    elif key == "PRIO_RR":
+        def pick(s, r):
+            best_key = min(s.pkey(p) for p in r)
+            grp = [p for p in r if s.pkey(p) == best_key]
+            b = min(grp, key=lambda p: s.seq[p])
+            return b, f"Priority {_fmt(s.prio(b))} is the best level; {b} is first in the Round Robin of that level."
+        pol = QuantumPolicy(q, pick, arrival_cap=True)
+    elif key == "HRRN":
+        ratio = lambda s, p: (s.t - s.byid[p].at + s.byid[p].bt) / s.byid[p].bt
+        pol = KeyPolicy(lambda s, p: -ratio(s, p), lambda s, p: f"{ratio(s, p):.2f}", "Highest response ratio")
+    elif key == "MLQ":
+        pol = MultiLevel([(a, qq) for a, qq in opts.mlq_levels], False, opts)
+    elif key == "MLFQ":
+        lv = [("RR", qq) for qq in opts.mlfq_quanta] + [("FCFS", 0.0)]
+        pol = MultiLevel(lv, True, opts)
+    elif key == "EDF":
+        dl = lambda s, p: s.byid[p].deadline if s.byid[p].deadline is not None else INF
+        pol = KeyPolicy(dl, lambda s, p: "-" if dl(s, p) == INF else _fmt(dl(s, p)), "Nearest deadline",
+                        preemptive=True, sticky=True)
+    elif key == "LOTTERY":
+        rng = random.Random(opts.seed)
+
+        def pick(s, r):
+            r = sorted(r, key=lambda p: s.seq[p])
+            tot = sum(s.tickets(p) for p in r)
+            draw = rng.randint(1, tot)
+            acc = 0
+            for p in r:
+                acc += s.tickets(p)
+                if draw <= acc:
+                    return p, f"Lottery: ticket #{draw} of {tot} drawn → {p} (holds {s.tickets(p)} tickets)."
+        pol = QuantumPolicy(q, pick)
+    elif key == "STRIDE":
+        def pick(s, r):
+            b = min(r, key=lambda p: (s.extra["pass"][p], s.seq[p]))
+            return b, (f"Smallest pass value: {b}({s.extra['pass'][b]:.0f}), "
+                       f"stride {1000 / s.tickets(b):.0f} ({s.tickets(b)} tickets).")
+        pol = StridePolicy(q, pick)
+    else:
+        raise ValueError(f"Unknown algorithm: {key}")
+    return _simulate(procs, opts, pol, key)
+
+
+def run_all(procs: List[ProcessInput], opts: Optional[SchedOptions] = None) -> Dict[str, ScheduleOutput]:
+    return {a.key: run_algorithm(a.key, procs, opts) for a in ALGOS}
+
+
+def comparison_rows(outs: Dict[str, ScheduleOutput]) -> List[dict]:
+    rows = []
+    for k, o in outs.items():
+        rows.append(dict(key=k, name=o.algorithm, mode=o.mode, avg_wt=o.avg_wt, avg_tat=o.avg_tat,
+                         avg_rt=o.avg_rt, util=o.cpu_utilization, throughput=o.throughput,
+                         cs=o.cs_count, end=o.end_time))
+    return sorted(rows, key=lambda r: (r["avg_wt"], r["avg_tat"]))
+
+
+def comparison_text(rows: List[dict]) -> List[str]:
+    if not rows:
+        return []
+    bw = min(rows, key=lambda r: r["avg_wt"])
+    bt = min(rows, key=lambda r: r["avg_tat"])
+    br = min(rows, key=lambda r: r["avg_rt"])
+    ww = max(rows, key=lambda r: r["avg_wt"])
+    return [f"Best average waiting time: {bw['name']} ({_fmt(bw['avg_wt'])}).",
+            f"Best average turnaround time: {bt['name']} ({_fmt(bt['avg_tat'])}).",
+            f"Best average response time: {br['name']} ({_fmt(br['avg_rt'])}).",
+            f"Worst average waiting time: {ww['name']} ({_fmt(ww['avg_wt'])})."]
