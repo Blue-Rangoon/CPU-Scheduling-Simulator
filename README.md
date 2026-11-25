@@ -22,7 +22,7 @@ The project makes operating-system CPU scheduling behavior easier to understand 
 | Highest Response Ratio Next | `HRRN` | Non-preemptive | Selects the process with the highest `(waiting time + burst time) / burst time` ratio. |
 | Multilevel Queue | `MLQ` | Queue-based | Assigns processes to fixed queues and uses a configured scheduling policy for each queue. |
 
-Priority convention, priority aging, context-switch time, quantum, queue configuration, lottery seed, and other algorithm-specific options are configurable in the application.
+Priority convention, priority aging, context-switch time, quantum, queue configuration, and other algorithm-specific options are configurable in the application.
 
 ## Features
 
@@ -100,7 +100,7 @@ deactivate
 ## Using the Simulator
 
 1. Set each process's arrival time, burst time, and optional priority, queue, or deadline.
-2. Configure the required quantum, context-switch time, priority convention, aging, queue levels, or lottery seed.
+2. Configure the required quantum, context-switch time, priority convention, aging or queue levels.
 3. Select an algorithm and run it.
 4. Use the Results, Summary, Steps, or Gantt views to inspect the outcome.
 5. Use **Compare All** to rank and compare every algorithm for the current process set.
@@ -115,7 +115,7 @@ The first row must contain the column headers. Supported header aliases include 
 | `PID` | No | Process identification |
 | `Arrival Time` | Yes | All algorithms |
 | `Burst Time` | Yes | All algorithms |
-| `Priority` | No | Priority, Lottery, Stride, and MLQ algorithms |
+| `Priority` | No | Priority, and MLQ algorithms |
 | `Queue` | No | Multilevel Queue |
 | `Deadline` | No | Earliest Deadline First |
 
@@ -141,7 +141,7 @@ CPU-Scheduling-Simulator-main/
 |-- test_schedulers.py              # Scheduler, invariant, and I/O tests
 |-- requirements.txt                # Python dependencies
 |-- sample_processes.xlsx           # Example process input workbook
-|-- cpu_scheduling_dynamic_v2 (1).ipynb
+|-- cpu_scheduling_dynamic_v2.ipynb
 |-- LICENSE
 |-- README.md
 `-- .gitignore
@@ -155,4 +155,4 @@ Run the test suite from the project root:
 python -m unittest -v
 ```
 
-The tests validate scheduler results, random-input invariants, context switches, priority aging, deadlines, queues, reproducible lottery scheduling, and Excel/CSV/PNG exports.
+The tests validate scheduler results, random-input invariants, context switches, priority aging, deadlines, queues, and Excel/CSV/PNG exports.
